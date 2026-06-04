@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*_mimo_work/
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+outputs/
+
+# Config (contains encrypted API keys)
+config.json
+.env

@@ -7,13 +7,10 @@ import argparse
 import subprocess
 import platform
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from getpass import getpass
 
 from cryptography.fernet import Fernet
-
-import tkinter as tk
-from tkinter import filedialog
 
 from openai import OpenAI, AuthenticationError, APIStatusError
 
@@ -47,8 +44,9 @@ SPEAKER_PROMPT = """
 """
 
 
+# ── 基础工具函数 ──────────────────────────────────────────────
+
 def looks_like_repetition_loop(text: str) -> bool:
-    """检测 ASR 输出是否出现重复死循环/乱码。"""
     if not text:
         return True
 
@@ -71,14 +69,12 @@ def looks_like_repetition_loop(text: str) -> bool:
 
 
 def get_machine_key() -> bytes:
-    """基于本机 hostname + username 派生加密密钥，绑定当前机器。"""
     raw = f"{platform.node()}-{os.getenv('USERNAME', os.getenv('USER', 'default'))}"
     digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
 
 def load_saved_config() -> dict:
-    """读取并解密已保存的配置。失败返回空 dict。"""
     if not CONFIG_FILE.exists():
         return {}
 
@@ -92,7 +88,6 @@ def load_saved_config() -> dict:
 
 
 def save_config(api_key: str, base_url: str) -> None:
-    """加密并保存 API Key 和 Base URL。"""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     data = json.dumps({"api_key": api_key, "base_url": base_url}).encode("utf-8")
     fernet = Fernet(get_machine_key())
@@ -100,11 +95,277 @@ def save_config(api_key: str, base_url: str) -> None:
     CONFIG_FILE.write_bytes(encrypted)
 
 
+def run_cmd(cmd: List[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def check_ffmpeg() -> None:
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+    except Exception:
+        print("错误：找不到 ffmpeg。请先安装 ffmpeg。")
+        print("Windows: winget install Gyan.FFmpeg")
+        print("Mac: brew install ffmpeg")
+        print("Linux Ubuntu/Debian: sudo apt install ffmpeg")
+        sys.exit(1)
+
+
+def extract_audio_to_mp3(input_path: Path, output_path: Path, bitrate: str = "64k") -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(input_path),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        "-ar", "16000",
+        "-ac", "1",
+        str(output_path)
+    ]
+    run_cmd(cmd)
+
+
+def split_audio_to_mp3_parts(
+    input_audio: Path,
+    output_dir: Path,
+    segment_seconds: int,
+    bitrate: str = "64k"
+) -> List[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern = output_dir / "part_%03d.mp3"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(input_audio),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        "-ar", "16000",
+        "-ac", "1",
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        str(pattern)
+    ]
+    run_cmd(cmd)
+
+    return sorted(output_dir.glob("part_*.mp3"))
+
+
+def file_to_base64_data_url(audio_path: Path, mime_type: str = "audio/mpeg") -> str:
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{audio_base64}"
+
+
+def estimate_base64_size_mb(file_path: Path) -> float:
+    raw_size = file_path.stat().st_size
+    base64_size = raw_size * 4 / 3
+    return base64_size / 1024 / 1024
+
+
+def extract_text_from_message(message) -> str:
+    content = getattr(message, "content", None)
+    reasoning_content = getattr(message, "reasoning_content", None)
+
+    if content:
+        return content.strip()
+
+    if reasoning_content:
+        return reasoning_content.strip()
+
+    return ""
+
+
+def is_auth_error(error: Exception) -> bool:
+    if isinstance(error, AuthenticationError):
+        return True
+
+    if isinstance(error, APIStatusError) and error.status_code in (401, 403):
+        return True
+
+    message = str(error).lower()
+    keywords = [
+        "incorrect api key",
+        "invalid api key",
+        "unauthorized",
+        "authentication",
+        "api-key",
+        "api key",
+        "forbidden"
+    ]
+
+    return any(keyword in message for keyword in keywords)
+
+
+def make_client(api_key: str, base_url: str) -> OpenAI:
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url
+    )
+
+
+# ── API 调用 ─────────────────────────────────────────────────
+
+def call_mimo_asr(
+    audio_data_url: str,
+    language: str,
+    api_key: str,
+    base_url: str
+) -> str:
+    def request(client: OpenAI):
+        return client.chat.completions.create(
+            model="mimo-v2.5-asr",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_data_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            extra_body={
+                "asr_options": {
+                    "language": language
+                }
+            }
+        )
+
+    completion = request(make_client(api_key, base_url))
+    return extract_text_from_message(completion.choices[0].message)
+
+
+def call_mimo_audio_understanding(
+    audio_data_url: str,
+    model: str,
+    prompt: str,
+    api_key: str,
+    base_url: str,
+    max_tokens: int = 8192
+) -> str:
+    def request(client: OpenAI):
+        return client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are MiMo, an AI assistant developed by Xiaomi."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_data_url
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            max_completion_tokens=max_tokens
+        )
+
+    completion = request(make_client(api_key, base_url))
+    return extract_text_from_message(completion.choices[0].message)
+
+
+def process_one_audio_part(
+    audio_path: Path,
+    mode: str,
+    language: str,
+    prompt: str,
+    api_key: str,
+    base_url: str
+) -> str:
+    audio_data_url = file_to_base64_data_url(audio_path, mime_type="audio/mpeg")
+
+    if mode == "asr":
+        return call_mimo_asr(
+            audio_data_url=audio_data_url,
+            language=language,
+            api_key=api_key,
+            base_url=base_url
+        )
+
+    if mode == "v25":
+        return call_mimo_audio_understanding(
+            audio_data_url=audio_data_url,
+            model="mimo-v2.5",
+            prompt=prompt,
+            api_key=api_key,
+            base_url=base_url
+        )
+
+    if mode == "omni":
+        return call_mimo_audio_understanding(
+            audio_data_url=audio_data_url,
+            model="mimo-v2-omni",
+            prompt=prompt,
+            api_key=api_key,
+            base_url=base_url
+        )
+
+    raise ValueError(f"未知 mode: {mode}")
+
+
+# ── CLI 非交互模式 ──────────────────────────────────────────
+
+def resolve_base_url(api_key: str, base_url: Optional[str]) -> str:
+    if base_url:
+        return base_url
+
+    if api_key.startswith("sk-"):
+        return PAYG_BASE_URL
+
+    if api_key.startswith("tp-"):
+        saved = load_saved_config()
+        if saved.get("base_url"):
+            return saved["base_url"]
+        return TOKEN_PLAN_CN_BASE_URL
+
+    saved = load_saved_config()
+    if saved.get("base_url"):
+        return saved["base_url"]
+
+    return PAYG_BASE_URL
+
+
+def resolve_api_key(cli_key: Optional[str]) -> Optional[str]:
+    if cli_key:
+        return cli_key
+
+    env_key = os.environ.get("MIMO_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    saved = load_saved_config()
+    if saved.get("api_key"):
+        return saved["api_key"]
+
+    return None
+
+
+# ── 交互模式 ────────────────────────────────────────────────
+
 def enable_windows_dpi_awareness() -> None:
-    """
-    改善 Windows 高 DPI / 高缩放下 tkinter 文件选择框模糊或比例怪的问题。
-    macOS / Linux 会自动跳过。
-    """
     if platform.system() != "Windows":
         return
 
@@ -120,6 +381,9 @@ def enable_windows_dpi_awareness() -> None:
 
 
 def choose_one_file() -> Path:
+    import tkinter as tk
+    from tkinter import filedialog
+
     enable_windows_dpi_awareness()
 
     root = tk.Tk()
@@ -211,7 +475,6 @@ def guess_base_url_from_key(api_key: str) -> str:
 def get_api_key_and_base_url() -> Tuple[str, str]:
     print("\n=== 第 1 步：API Key 设置 ===")
 
-    # 优先使用环境变量
     api_key = os.environ.get("MIMO_API_KEY", "").strip()
     base_url = os.environ.get("MIMO_BASE_URL", "").strip()
 
@@ -228,7 +491,6 @@ def get_api_key_and_base_url() -> Tuple[str, str]:
         print(f"当前使用 Base URL: {base_url}")
         return api_key, base_url
 
-    # 尝试加载已保存的配置
     saved = load_saved_config()
     if saved.get("api_key") and saved.get("base_url"):
         masked = saved["api_key"][:4] + "****" + saved["api_key"][-4:]
@@ -238,7 +500,6 @@ def get_api_key_and_base_url() -> Tuple[str, str]:
             print(f"当前使用 Base URL: {saved['base_url']}")
             return saved["api_key"], saved["base_url"]
 
-    # 手动输入
     print("没有检测到环境变量或已保存的配置。")
     api_key = ask_non_empty("请输入 MIMO_API_KEY，支持 sk- 或 tp-：", secret=True)
     base_url = guess_base_url_from_key(api_key)
@@ -289,342 +550,63 @@ def choose_language() -> str:
         print("输入无效，请重新选择。")
 
 
-def make_client(api_key: str, base_url: str) -> OpenAI:
-    return OpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
+# ── 主流程（两种模式共用） ──────────────────────────────────
 
-
-def is_auth_error(error: Exception) -> bool:
-    if isinstance(error, AuthenticationError):
-        return True
-
-    if isinstance(error, APIStatusError) and error.status_code in (401, 403):
-        return True
-
-    message = str(error).lower()
-    keywords = [
-        "incorrect api key",
-        "invalid api key",
-        "unauthorized",
-        "authentication",
-        "api-key",
-        "api key",
-        "forbidden"
-    ]
-
-    return any(keyword in message for keyword in keywords)
-
-
-def call_with_api_key_retry(call_func, api_key: str, base_url: str, max_retries: int = 3):
-    for attempt in range(1, max_retries + 1):
-        client = make_client(api_key, base_url)
-
-        try:
-            return call_func(client)
-
-        except Exception as e:
-            if is_auth_error(e):
-                print("\nAPI Key 无效、过期、没有权限，或者 Base URL 与 Key 类型不匹配。")
-
-                if attempt >= max_retries:
-                    print("已达到最大重试次数，程序退出。")
-                    raise
-
-                api_key = ask_non_empty("请重新输入 MIMO_API_KEY：", secret=True)
-                base_url = guess_base_url_from_key(api_key)
-                save_config(api_key, base_url)
-                print(f"当前使用 Base URL: {base_url}")
-                continue
-
-            raise
-
-
-def run_cmd(cmd: List[str]) -> None:
-    print("运行命令:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-
-def check_ffmpeg() -> None:
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
-    except Exception:
-        print("错误：找不到 ffmpeg。请先安装 ffmpeg。")
-        print("Windows: winget install Gyan.FFmpeg")
-        print("Mac: brew install ffmpeg")
-        print("Linux Ubuntu/Debian: sudo apt install ffmpeg")
-        sys.exit(1)
-
-
-def extract_audio_to_mp3(input_path: Path, output_path: Path, bitrate: str = "64k") -> None:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", str(input_path),
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", bitrate,
-        "-ar", "16000",
-        "-ac", "1",
-        str(output_path)
-    ]
-    run_cmd(cmd)
-
-
-def split_audio_to_mp3_parts(
-    input_audio: Path,
-    output_dir: Path,
-    segment_seconds: int,
-    bitrate: str = "64k"
-) -> List[Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    pattern = output_dir / "part_%03d.mp3"
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", str(input_audio),
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", bitrate,
-        "-ar", "16000",
-        "-ac", "1",
-        "-f", "segment",
-        "-segment_time", str(segment_seconds),
-        str(pattern)
-    ]
-    run_cmd(cmd)
-
-    return sorted(output_dir.glob("part_*.mp3"))
-
-
-def file_to_base64_data_url(audio_path: Path, mime_type: str = "audio/mpeg") -> str:
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-    return f"data:{mime_type};base64,{audio_base64}"
-
-
-def estimate_base64_size_mb(file_path: Path) -> float:
-    raw_size = file_path.stat().st_size
-    base64_size = raw_size * 4 / 3
-    return base64_size / 1024 / 1024
-
-
-def extract_text_from_message(message) -> str:
-    content = getattr(message, "content", None)
-    reasoning_content = getattr(message, "reasoning_content", None)
-
-    if content:
-        return content.strip()
-
-    if reasoning_content:
-        return reasoning_content.strip()
-
-    return ""
-
-
-def call_mimo_asr(
-    audio_data_url: str,
-    language: str,
-    api_key: str,
-    base_url: str
-) -> str:
-    def request(client: OpenAI):
-        return client.chat.completions.create(
-            model="mimo-v2.5-asr",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": audio_data_url
-                            }
-                        }
-                    ]
-                }
-            ],
-            extra_body={
-                "asr_options": {
-                    "language": language
-                }
-            }
-        )
-
-    completion = call_with_api_key_retry(request, api_key, base_url)
-    return extract_text_from_message(completion.choices[0].message)
-
-
-def call_mimo_audio_understanding(
-    audio_data_url: str,
-    model: str,
-    prompt: str,
-    api_key: str,
-    base_url: str,
-    max_tokens: int = 8192
-) -> str:
-    def request(client: OpenAI):
-        return client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are MiMo, an AI assistant developed by Xiaomi."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": audio_data_url
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ]
-                }
-            ],
-            max_completion_tokens=max_tokens
-        )
-
-    completion = call_with_api_key_retry(request, api_key, base_url)
-    return extract_text_from_message(completion.choices[0].message)
-
-
-def process_one_audio_part(
-    audio_path: Path,
+def run_pipeline(
+    input_path: Path,
     mode: str,
     language: str,
-    prompt: str,
     api_key: str,
-    base_url: str
-) -> str:
-    audio_data_url = file_to_base64_data_url(audio_path, mime_type="audio/mpeg")
-
-    if mode == "asr":
-        return call_mimo_asr(
-            audio_data_url=audio_data_url,
-            language=language,
-            api_key=api_key,
-            base_url=base_url
-        )
-
-    if mode == "v25":
-        return call_mimo_audio_understanding(
-            audio_data_url=audio_data_url,
-            model="mimo-v2.5",
-            prompt=prompt,
-            api_key=api_key,
-            base_url=base_url
-        )
-
-    if mode == "omni":
-        return call_mimo_audio_understanding(
-            audio_data_url=audio_data_url,
-            model="mimo-v2-omni",
-            prompt=prompt,
-            api_key=api_key,
-            base_url=base_url
-        )
-
-    raise ValueError(f"未知 mode: {mode}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="选择一个视频/音频文件，然后调用 MiMo 模型转写"
-    )
-
-    parser.add_argument(
-        "--segment-seconds",
-        type=int,
-        default=180,
-        help="切片长度，默认 180 秒（3 分钟）"
-    )
-
-    parser.add_argument(
-        "--bitrate",
-        default="128k",
-        help="提取音频的 mp3 码率，默认 128k"
-    )
-
-    parser.add_argument(
-        "--prompt",
-        default=SPEAKER_PROMPT,
-        help="给 mimo-v2.5 / mimo-v2-omni 的提示词"
-    )
-
-    args = parser.parse_args()
-
-    api_key, base_url = get_api_key_and_base_url()
-    mode = choose_model_mode()
-    language = choose_language()
-
-    print("\n=== 第 4 步：选择文件 ===")
-    input_path = choose_one_file()
-    print(f"你选择的文件是：{input_path}")
+    base_url: str,
+    prompt: str,
+    segment_seconds: int,
+    bitrate: str,
+    output_dir: Optional[Path] = None,
+    print_text: bool = False,
+) -> Path:
+    """核心转写流程，交互/CLI 两种模式共用。返回最终输出文件路径。"""
 
     check_ffmpeg()
 
-    work_dir = input_path.parent / f"{input_path.stem}_mimo_work"
-    work_dir.mkdir(exist_ok=True)
+    if output_dir is None:
+        output_dir = input_path.parent
+    work_dir = output_dir / f"{input_path.stem}_mimo_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    # MP3 直接保存在原文件旁边
-    audio_path = input_path.parent / f"{input_path.stem}.mp3"
+    audio_path = output_dir / f"{input_path.stem}.mp3"
 
-    print("\n=== 第 5 步：提取/转换音频为 mp3 ===")
-    extract_audio_to_mp3(input_path, audio_path, bitrate=args.bitrate)
+    print(f"\n[1/4] 提取音频 → {audio_path}")
+    extract_audio_to_mp3(input_path, audio_path, bitrate=bitrate)
 
     raw_audio_mb = audio_path.stat().st_size / 1024 / 1024
-    b64_audio_mb = estimate_base64_size_mb(audio_path)
-
-    print(f"\nMP3 已保存到: {audio_path}")
-    print(f"音频大小: {raw_audio_mb:.2f} MB")
-    print(f"Base64 预计大小: {b64_audio_mb:.2f} MB")
+    print(f"       音频大小: {raw_audio_mb:.2f} MB")
 
     modes = ["asr", "v25", "omni"] if mode == "all" else [mode]
+    last_output_path = None
 
     for current_mode in modes:
-        print("\n==============================")
-        print(f"开始处理模式: {current_mode}")
-        print("==============================")
+        print(f"\n[2/4] 模式: {current_mode} — 切片（每段 {segment_seconds} 秒）")
 
         limit_mb = 10 if current_mode == "asr" else 50
 
-        # 永远切片，避免长音频导致截断/重复/幻觉
-        print(f"开始切片（每段 {args.segment_seconds} 秒）...")
         parts_dir = work_dir / f"parts_{current_mode}"
         parts = split_audio_to_mp3_parts(
             input_audio=audio_path,
             output_dir=parts_dir,
-            segment_seconds=args.segment_seconds,
-            bitrate=args.bitrate
+            segment_seconds=segment_seconds,
+            bitrate=bitrate
         )
-        print(f"共切分为 {len(parts)} 段。")
+        print(f"       共 {len(parts)} 段")
 
         results = []
 
         for idx, part in enumerate(parts, start=1):
             part_b64_mb = estimate_base64_size_mb(part)
-            print(f"\n处理第 {idx}/{len(parts)} 段: {part.name}")
-            print(f"Base64 预计大小: {part_b64_mb:.2f} MB")
+            print(f"  [{idx}/{len(parts)}] {part.name} ({part_b64_mb:.2f} MB b64)")
 
             if part_b64_mb > limit_mb:
-                print(f"警告：这一段仍然超过 {limit_mb} MB，建议把 --segment-seconds 调小。")
-                print("跳过这一段。")
+                print(f"  超过 {limit_mb} MB，跳过")
+                results.append(f"【Part {idx}】\n[超过大小限制，已跳过]")
                 continue
 
             try:
@@ -632,33 +614,169 @@ def main():
                     audio_path=part,
                     mode=current_mode,
                     language=language,
-                    prompt=args.prompt,
+                    prompt=prompt,
                     api_key=api_key,
                     base_url=base_url
                 )
             except Exception as e:
-                print(f"调用 MiMo 失败: {e}")
+                print(f"  调用失败: {e}")
                 text = ""
 
             if looks_like_repetition_loop(text):
-                print(f"警告：第 {idx} 段出现重复/乱码，建议降低 --segment-seconds 或提高 --bitrate 后重试该段。")
+                print(f"  疑似重复/乱码，跳过")
                 results.append(f"【Part {idx}】\n[疑似重复/乱码，已跳过]")
             else:
                 results.append(f"【Part {idx}】\n{text}".strip())
 
         final_text = "\n\n".join(results).strip()
 
-        output_path = input_path.parent / f"{input_path.stem}.{current_mode}.speaker_transcript.txt"
+        suffix = f".{current_mode}.speaker_transcript" if mode == "all" else ".speaker_transcript"
+        output_path = output_dir / f"{input_path.stem}{suffix}.txt"
         output_path.write_text(final_text, encoding="utf-8")
+        last_output_path = output_path
 
-        print(f"\n=== {current_mode} 模式完成 ===")
-        print(f"结果已保存到: {output_path}")
+        print(f"\n[3/4] 转写完成")
+        print(f"       结果: {output_path}")
 
-        print("\n===== 预览 =====")
-        print(final_text[:1000])
+        if print_text:
+            print(f"\n{'='*60}")
+            print(final_text)
+            print(f"{'='*60}")
 
-        if len(final_text) > 1000:
-            print("\n...内容较长，已截断预览，请看 txt 文件。")
+    print(f"\n[4/4] 全部完成")
+    return last_output_path
+
+
+# ── 入口：自动判断交互 / CLI 模式 ───────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="视频/音频转文字工具 — 支持 CLI 和交互两种模式"
+    )
+
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        default=None,
+        help="输入文件路径。不指定则进入交互模式（弹窗选择文件）"
+    )
+
+    parser.add_argument(
+        "--model", "-m",
+        choices=["asr", "v25", "omni", "all"],
+        default=None,
+        help="模型选择。CLI 模式必填，交互模式下会提示选择"
+    )
+
+    parser.add_argument(
+        "--language", "-l",
+        choices=["zh", "en", "auto"],
+        default=None,
+        help="音频语言。CLI 模式必填，交互模式下会提示选择"
+    )
+
+    parser.add_argument(
+        "--api-key", "-k",
+        default=None,
+        help="MiMo API Key。未指定则读环境变量 MIMO_API_KEY 或已保存配置"
+    )
+
+    parser.add_argument(
+        "--base-url", "-u",
+        default=None,
+        help="API Base URL。未指定则根据 Key 类型自动推断"
+    )
+
+    parser.add_argument(
+        "--segment-seconds",
+        type=int,
+        default=180,
+        help="切片长度，秒，默认 180"
+    )
+
+    parser.add_argument(
+        "--bitrate",
+        default="128k",
+        help="提取音频码率，默认 128k"
+    )
+
+    parser.add_argument(
+        "--prompt",
+        default=SPEAKER_PROMPT,
+        help="给 v25/omni 模型的提示词"
+    )
+
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=None,
+        help="输出目录，默认与输入文件同目录"
+    )
+
+    parser.add_argument(
+        "--print-text",
+        action="store_true",
+        help="转写完成后在终端打印全文"
+    )
+
+    args = parser.parse_args()
+
+    # ── CLI 模式：指定了文件路径 ──
+    if args.input_file:
+        input_path = Path(args.input_file).resolve()
+        if not input_path.exists():
+            print(f"错误：文件不存在 → {input_path}")
+            sys.exit(1)
+
+        api_key = resolve_api_key(args.api_key)
+        if not api_key:
+            print("错误：未提供 API Key。请通过 --api-key、环境变量 MIMO_API_KEY 或先运行一次保存配置。")
+            sys.exit(1)
+
+        base_url = resolve_base_url(api_key, args.base_url)
+
+        mode = args.model
+        if mode is None:
+            print("错误：CLI 模式需指定 --model (-m)，可选 asr / v25 / omni / all")
+            sys.exit(1)
+
+        language = args.language or "zh"
+
+        output_dir = Path(args.output_dir).resolve() if args.output_dir else None
+
+        run_pipeline(
+            input_path=input_path,
+            mode=mode,
+            language=language,
+            api_key=api_key,
+            base_url=base_url,
+            prompt=args.prompt,
+            segment_seconds=args.segment_seconds,
+            bitrate=args.bitrate,
+            output_dir=output_dir,
+            print_text=args.print_text,
+        )
+
+    # ── 交互模式：未指定文件路径 ──
+    else:
+        api_key, base_url = get_api_key_and_base_url()
+        mode = choose_model_mode()
+        language = choose_language()
+
+        print("\n=== 第 4 步：选择文件 ===")
+        input_path = choose_one_file()
+        print(f"你选择的文件是：{input_path}")
+
+        run_pipeline(
+            input_path=input_path,
+            mode=mode,
+            language=language,
+            api_key=api_key,
+            base_url=base_url,
+            prompt=args.prompt,
+            segment_seconds=args.segment_seconds,
+            bitrate=args.bitrate,
+            print_text=True,
+        )
 
 
 if __name__ == "__main__":

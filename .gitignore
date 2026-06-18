@@ -28,6 +28,14 @@ Thumbs.db
 *.m4a
 *.flac
 *.ogg
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.flv
+*.webm
+*.txt
 outputs/
 
 # Config (contains encrypted API keys)
